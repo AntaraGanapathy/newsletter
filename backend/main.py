@@ -12,7 +12,6 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import requests
-import asyncio
 from dotenv import load_dotenv
 import re
 
@@ -74,10 +73,7 @@ def get_db():
 # Configuration
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "your_news_api_key")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "your_gemini_api_key")
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "your_sendgrid_api_key")
 FROM_EMAIL = os.getenv("FROM_EMAIL", "noreply@yournewsletter.com")
-
-GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_PASSWORD = os.getenv("GMAIL_PASSWORD")
 
 
@@ -137,9 +133,17 @@ async def summarize_article(title: str, content: str) -> str:
             content = content[:max_content_length] + "..."
 
         prompt = f"""
-Please provide a concise 3-4 sentence summary of the following news article.\n\nTitle: {title}\nContent: {content}\n\nSummary:"""
+        Write a self-contained summary of the following news article in 2-3 sentences. 
+        Do not mention that you are summarizing, do not reference the title or content explicitly, and do not include phrases like "based on the article." 
+        Focus only on the main argument, discussion, and key points.
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={GEMINI_API_KEY}"
+        Title: {title}
+        Content: {content}
+
+        Summary:
+        """
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={GEMINI_API_KEY}"
         headers = {"Content-Type": "application/json"}
         data = {
             "contents": [
@@ -217,41 +221,24 @@ def generate_newsletter_html(user_name: Optional[str], articles_by_category: dic
     return html_content
 
 async def send_email(to_email: str, subject: str, html_content: str):
-    """Send email using SendGrid or SMTP."""
+    """Send email SMTP."""
     try:
-        # Using SendGrid API
-        import sendgrid
-        from sendgrid.helpers.mail import Mail
         
-        sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
-        mail = Mail(
-            from_email=FROM_EMAIL,
-            to_emails=to_email,
-            subject=subject,
-            html_content=html_content
-        )
-        
-        response = sg.send(mail)
-        return response.status_code == 202
-    except Exception as e:
-        print(f"Error sending email: {e}")
-        # Fallback to Gmail SMTP
-        try:
-            msg = MIMEMultipart('alternative')
-            msg['Subject'] = subject
-            msg['From'] = FROM_EMAIL
-            msg['To'] = to_email
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From'] = FROM_EMAIL
+        msg['To'] = to_email
 
-            html_part = MIMEText(html_content, 'html')
-            msg.attach(html_part)
+        html_part = MIMEText(html_content, 'html')
+        msg.attach(html_part)
 
-            with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-                server.login(GMAIL_USER, GMAIL_PASSWORD)
-                server.sendmail(FROM_EMAIL, to_email, msg.as_string())
-            return True
-        except Exception as smtp_error:
-            print(f"SMTP fallback failed: {smtp_error}")
-            return False
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(FROM_EMAIL, GMAIL_PASSWORD)
+            server.sendmail(FROM_EMAIL, to_email, msg.as_string())
+        return True
+    except Exception as smtp_error:
+        print(f"SMTP fallback failed: {smtp_error}")
+        return False
 
 @app.get("/")
 async def root():
@@ -295,12 +282,20 @@ async def register_user(user_data: UserRegistration, db: Session = Depends(get_d
         db.commit()
         db.refresh(db_user)
         
-        # Fetch news and generate newsletter
+        # Fetch news
         articles_by_category = await fetch_news_articles(user_data.categories)
-        
+
+        # Summarize each article using Gemini
+        for category, articles in articles_by_category.items():
+            for article in articles:
+                title = article.get("title", "")
+                content = article.get("content") or article.get("description") or ""
+                summary = await summarize_article(title, content)
+                article["description"] = summary
+
         # Generate newsletter HTML
         html_content = generate_newsletter_html(user_data.name, articles_by_category)
-        
+
         # Send email
         subject = "Your Personalized AI Newsletter 📰"
         email_sent = await send_email(user_data.email, subject, html_content)
