@@ -1,5 +1,7 @@
-from fastapi import FastAPI, HTTPException, Depends
+# backend/main.py
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -14,6 +16,9 @@ from email.mime.multipart import MIMEMultipart
 import requests
 from dotenv import load_dotenv
 import re
+import hashlib
+import secrets
+from email_templates import generate_newsletter_html, generate_unsubscribe_success_html, generate_unsubscribe_error_html
 
 load_dotenv()
 
@@ -32,6 +37,7 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=False)
     categories = Column(Text, nullable=False)  # JSON string
     newsletter_sent = Column(Boolean, default=False)
+    unsubscribe_token = Column(String, unique=True, nullable=False)  # New field for unsubscribe
     created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(bind=engine)
@@ -74,18 +80,20 @@ def get_db():
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "your_news_api_key")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "your_gemini_api_key")
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "your_sendgrid_api_key")
-FROM_EMAIL = os.getenv("FROM_EMAIL", "noreply@yournewsletter.com")
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")  # For unsubscribe links
 
-FROM_EMAIL = os.getenv("FROM_EMAIL")
+GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_PASSWORD = os.getenv("GMAIL_PASSWORD")
-
-
 
 # Available categories
 AVAILABLE_CATEGORIES = [
     "technology", "business", "sports", "health", 
     "entertainment", "science", "politics"
 ]
+
+def generate_unsubscribe_token() -> str:
+    """Generate a secure unsubscribe token."""
+    return secrets.token_urlsafe(32)
 
 def validate_email(email: str) -> bool:
     """Simple email validation"""
@@ -157,78 +165,20 @@ Please provide a concise 3-4 sentence summary of the following news article.\n\n
         print(f"Error summarizing article: {e}")
         return f"Summary unavailable. {title}"
 
-def generate_newsletter_html(user_name: Optional[str], articles_by_category: dict) -> str:
-    """Generate HTML newsletter content."""
-    greeting = f"Hello {user_name}," if user_name else "Hello,"
-    html_content = f'''<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Your Personalized Newsletter</title>
-    <style>
-        body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; }}
-        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; text-align: center; border-radius: 10px; }}
-        .category {{ margin: 30px 0; }}
-        .category h2 {{ color: #667eea; border-bottom: 2px solid #667eea; padding-bottom: 10px; text-transform: capitalize; }}
-        .article {{ background: #f9f9f9; padding: 20px; margin: 15px 0; border-radius: 8px; border-left: 4px solid #667eea; }}
-        .article h3 {{ margin: 0 0 10px 0; color: #333; }}
-        .article a {{ color: #667eea; text-decoration: none; font-weight: bold; }}
-        .article a:hover {{ text-decoration: underline; }}
-        .summary {{ color: #666; margin: 10px 0; }}
-        .footer {{ text-align: center; margin-top: 40px; padding: 20px; background: #f0f0f0; border-radius: 8px; }}
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>🗞️ Your AI-Powered Newsletter</h1>
-        <p>{greeting}</p>
-        <p>Here's your personalized news digest from the past week!</p>
-    </div>
-'''
-    for category, articles in articles_by_category.items():
-        if not articles:
-            continue
-        html_content += f'''
-    <div class="category">
-        <h2>{category.title()}</h2>
-'''
-        for article in articles:
-            title = article.get("title", "No title")
-            url = article.get("url", "#")
-            description = article.get("description", "")
-            html_content += f'''
-        <div class="article">
-            <h3><a href="{url}" target="_blank">{title}</a></h3>
-            <div class="summary">{description}</div>
-        </div>
-'''
-        html_content += "    </div>"
-    html_content += '''
-    <div class="footer">
-        <p>Thanks for trying our AI-Powered Newsletter Service! 🚀</p>
-        <p>This was your one-time personalized newsletter. We hope you found it valuable!</p>
-        <p><small>This newsletter was generated using AI and the latest news APIs.</small></p>
-    </div>
-</body>
-</html>
-'''
-    return html_content
-
 async def send_email(to_email: str, subject: str, html_content: str):
     """Send email using Gmail SMTP."""
     try:
         msg = MIMEMultipart('alternative')
         msg['Subject'] = subject
-        msg['From'] = FROM_EMAIL
+        msg['From'] = GMAIL_USER
         msg['To'] = to_email
 
         html_part = MIMEText(html_content, 'html')
         msg.attach(html_part)
 
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-            server.login(FROM_EMAIL, GMAIL_PASSWORD)
-            server.sendmail(FROM_EMAIL, to_email, msg.as_string())
+            server.login(GMAIL_USER, GMAIL_PASSWORD)
+            server.sendmail(GMAIL_USER, to_email, msg.as_string())
         return True
     except Exception as smtp_error:
         print(f"SMTP failed: {smtp_error}")
@@ -265,12 +215,16 @@ async def register_user(user_data: UserRegistration, db: Session = Depends(get_d
         raise HTTPException(status_code=400, detail="At least one category must be selected")
     
     try:
+        # Generate unsubscribe token
+        unsubscribe_token = generate_unsubscribe_token()
+        
         # Create user
         db_user = User(
             name=user_data.name,
             email=user_data.email,
             categories=",".join(user_data.categories),
-            newsletter_sent=False
+            newsletter_sent=False,
+            unsubscribe_token=unsubscribe_token
         )
         db.add(db_user)
         db.commit()
@@ -279,8 +233,11 @@ async def register_user(user_data: UserRegistration, db: Session = Depends(get_d
         # Fetch news and generate newsletter
         articles_by_category = await fetch_news_articles(user_data.categories)
         
-        # Generate newsletter HTML
-        html_content = generate_newsletter_html(user_data.name, articles_by_category)
+        # Create unsubscribe URL
+        unsubscribe_url = f"{BASE_URL}/unsubscribe/{unsubscribe_token}"
+        
+        # Generate newsletter HTML using template
+        html_content = generate_newsletter_html(user_data.name, articles_by_category, unsubscribe_url)
         
         # Send email
         subject = "Your Personalized AI Newsletter 📰"
@@ -319,6 +276,40 @@ async def get_user(user_id: int, db: Session = Depends(get_db)):
         newsletter_sent=user.newsletter_sent,
         created_at=user.created_at
     )
+
+@app.get("/unsubscribe/{token}", response_class=HTMLResponse)
+async def unsubscribe_user(token: str, db: Session = Depends(get_db)):
+    """Unsubscribe user and delete their data."""
+    try:
+        # Find user by unsubscribe token
+        user = db.query(User).filter(User.unsubscribe_token == token).first()
+        
+        if not user:
+            # User not found - show error page
+            error_html = generate_unsubscribe_error_html("Invalid or expired unsubscribe link.")
+            return HTMLResponse(content=error_html, status_code=404)
+        
+        # Store email for confirmation page
+        user_email = user.email
+        
+        # Delete user data
+        db.delete(user)
+        db.commit()
+        
+        # Show success page
+        success_html = generate_unsubscribe_success_html(user_email)
+        return HTMLResponse(content=success_html, status_code=200)
+        
+    except Exception as e:
+        print(f"Error during unsubscribe: {e}")
+        db.rollback()
+        error_html = generate_unsubscribe_error_html("An error occurred while processing your request.")
+        return HTMLResponse(content=error_html, status_code=500)
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy", "timestamp": datetime.utcnow()}
 
 if __name__ == "__main__":
     import uvicorn

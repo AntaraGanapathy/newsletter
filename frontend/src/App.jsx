@@ -1,3 +1,4 @@
+// frontend/src/App.jsx
 import React, { useState } from 'react';
 import { Mail, Newspaper, Sparkles, Check, AlertCircle, Loader } from 'lucide-react';
 
