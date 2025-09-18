@@ -73,7 +73,10 @@ def get_db():
 # Configuration
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "your_news_api_key")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "your_gemini_api_key")
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "your_sendgrid_api_key")
 FROM_EMAIL = os.getenv("FROM_EMAIL", "noreply@yournewsletter.com")
+
+FROM_EMAIL = os.getenv("FROM_EMAIL")
 GMAIL_PASSWORD = os.getenv("GMAIL_PASSWORD")
 
 
@@ -133,17 +136,9 @@ async def summarize_article(title: str, content: str) -> str:
             content = content[:max_content_length] + "..."
 
         prompt = f"""
-        Write a self-contained summary of the following news article in 2-3 sentences. 
-        Do not mention that you are summarizing, do not reference the title or content explicitly, and do not include phrases like "based on the article." 
-        Focus only on the main argument, discussion, and key points.
+Please provide a concise 3-4 sentence summary of the following news article.\n\nTitle: {title}\nContent: {content}\n\nSummary:"""
 
-        Title: {title}
-        Content: {content}
-
-        Summary:
-        """
-
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={GEMINI_API_KEY}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={GEMINI_API_KEY}"
         headers = {"Content-Type": "application/json"}
         data = {
             "contents": [
@@ -221,9 +216,8 @@ def generate_newsletter_html(user_name: Optional[str], articles_by_category: dic
     return html_content
 
 async def send_email(to_email: str, subject: str, html_content: str):
-    """Send email SMTP."""
+    """Send email using Gmail SMTP."""
     try:
-        
         msg = MIMEMultipart('alternative')
         msg['Subject'] = subject
         msg['From'] = FROM_EMAIL
@@ -237,7 +231,7 @@ async def send_email(to_email: str, subject: str, html_content: str):
             server.sendmail(FROM_EMAIL, to_email, msg.as_string())
         return True
     except Exception as smtp_error:
-        print(f"SMTP fallback failed: {smtp_error}")
+        print(f"SMTP failed: {smtp_error}")
         return False
 
 @app.get("/")
@@ -282,20 +276,12 @@ async def register_user(user_data: UserRegistration, db: Session = Depends(get_d
         db.commit()
         db.refresh(db_user)
         
-        # Fetch news
+        # Fetch news and generate newsletter
         articles_by_category = await fetch_news_articles(user_data.categories)
-
-        # Summarize each article using Gemini
-        for category, articles in articles_by_category.items():
-            for article in articles:
-                title = article.get("title", "")
-                content = article.get("content") or article.get("description") or ""
-                summary = await summarize_article(title, content)
-                article["description"] = summary
-
+        
         # Generate newsletter HTML
         html_content = generate_newsletter_html(user_data.name, articles_by_category)
-
+        
         # Send email
         subject = "Your Personalized AI Newsletter 📰"
         email_sent = await send_email(user_data.email, subject, html_content)
